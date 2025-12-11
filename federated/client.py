@@ -18,7 +18,7 @@ class FedSubspaceClient:
     - save only theta_s update
     """
 
-    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, lr=5e-4, device="cuda"):
+    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, lr=5e-4, device="cuda", data_collator=None, dtype=torch.float16):
         self.client_id = client_id
         self.model = model  # same shared base model wrapper
         self.tokenizer = tokenizer
@@ -26,10 +26,13 @@ class FedSubspaceClient:
         self.output_dir = output_dir
         self.local_epochs = local_epochs
         self.device = device
+        self.data_collator = data_collator
+        self.dtype = dtype
+        self.lr = lr
 
         # Optimizer ONLY for theta_s
         self.optim_params = [self.model.adapter.theta_s]
-        self.opt = AdamW(self.optim_params, lr=lr)
+        # self.opt = AdamW(self.optim_params, lr=lr) # Trainer will handle optimizer or we can pass it
 
     def train(self):
         """
@@ -47,20 +50,22 @@ class FedSubspaceClient:
             output_dir=os.path.join(self.output_dir, f"client_{self.client_id}"),
             per_device_train_batch_size=4,
             gradient_accumulation_steps=1,
-            learning_rate=self.opt.param_groups[0]["lr"],
+            learning_rate=self.lr,
             num_train_epochs=self.local_epochs,
             optim="adamw_torch",
-            fp16=True,
+            fp16=(self.dtype == torch.float16),
+            bf16=(self.dtype == torch.bfloat16),
             logging_steps=10,
             save_strategy="no",
-            report_to=[]
+            report_to=[],
+            use_cpu=False
         )
 
         trainer = transformers.Trainer(
             model=self.model,
             args=args,
             train_dataset=self.dataloader.dataset,
-            data_collator=collate_fn,
+            data_collator=self.data_collator if self.data_collator else collate_fn,
             tokenizer=self.tokenizer,
         )
 
