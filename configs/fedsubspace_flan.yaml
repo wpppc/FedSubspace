@@ -1,0 +1,37 @@
+output_dir: "outputs/fedsubspace_flan"
+
+model:
+  path: "/home/wuqicen/base_models/llama2-7b/LLM-Research/llama-2-7b"
+
+lora:
+  r: 8
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+
+subspace:
+  dim: 520000
+  seed: 42
+
+data:
+  root: "data/fed_tasks/flan_experiment"
+  num_clients: 8
+  cutoff_len: 512
+  train_on_inputs: false
+
+federated:
+  rounds: 20
+  client_fraction: 1.0
+
+train:
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  local_epochs: 5
+  lr: 3e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+
+eval:
+  enabled: true
+  eval_every: 1
+  max_samples: 100

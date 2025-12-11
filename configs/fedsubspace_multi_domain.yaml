@@ -1,0 +1,92 @@
+output_dir: "outputs/fedsubspace_multi"
+
+model:
+  path: "/home/wuqicen/base_models/mistral-7b-v0.1"
+
+lora:
+  r: 8
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+subspace:
+  dim: 520000
+  seed: 42
+
+data:
+  mode: "multi_domain"
+  root: "data/fed_tasks"
+  num_clients: 10
+  partition_strategy: "uniform"
+  partition_alpha: 0.5
+  cutoff_len: 1024
+  train_on_inputs: false
+
+datasets:
+  metamathqa:
+    hf_name: "data/raw_datasets/metamathqa"
+    train_split: "train"
+  gsm8k:
+    hf_name: "data/raw_datasets/gsm8k"
+    split: "test"
+  math:
+    hf_name: "data/raw_datasets/math"
+    split: "test"
+
+  codefeedback:
+    hf_name: "data/raw_datasets/codefeedback"
+    train_split: "train"
+  humaneval:
+    hf_name: "data/raw_datasets/humaneval"
+    split: "test"
+  mbpp:
+    hf_name: "data/raw_datasets/mbpp"
+    split: "test"
+
+  commonsense170k:
+    hf_name: "data/raw_datasets/commonsense170k"
+    train_split: "train"
+  boolq:
+    hf_name: "data/raw_datasets/boolq"
+    split: "validation"
+  piqa:
+    hf_name: "data/raw_datasets/piqa"
+    split: "validation"
+  siqa:
+    hf_name: "data/raw_datasets/siqa"
+    split: "validation"
+  hellaswag:
+    hf_name: "data/raw_datasets/hellaswag"
+    split: "validation"
+  winogrande:
+    hf_name: "data/raw_datasets/winogrande"
+    split: "validation"
+  arc_e:
+    hf_name: "data/raw_datasets/ai2_arc"
+    split: "test"
+  arc_c:
+    hf_name: "data/raw_datasets/ai2_arc"
+    split: "test"
+  obqa:
+    hf_name: "data/raw_datasets/openbookqa"
+    split: "test"
+
+federated:
+  rounds: 5
+  client_fraction: 0.4
+
+train:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  local_epochs: 1
+  max_steps: 10000  # If > 0, overrides local_epochs. Set to e.g. 100 or 500 for faster training.
+  lr: 2e-3
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+
+eval:
+  enabled: true
+  eval_every: 1
+  max_samples: 500  # Limit evaluation samples for speed (null or -1 for all)

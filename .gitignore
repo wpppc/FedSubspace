@@ -1,0 +1,13 @@
+# Ignore large files and directories
+outputs/
+data/raw_datasets/
+data/fed_tasks/
+__pycache__/
+*.pyc
+*.pt
+*.bin
+*.log
+.vscode/
+.idea/
+FedDPA/
+old/

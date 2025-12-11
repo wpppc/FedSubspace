@@ -1,0 +1,37 @@
+# Core DL
+torch>=2.1.0
+torchvision
+torchaudio
+
+# Hugging Face Ecosystem
+transformers>=4.38.0
+datasets>=2.16.0
+accelerate>=0.27.0
+peft>=0.8.0
+tokenizers
+huggingface-hub
+
+# LLM Utilities
+bitsandbytes>=0.41.0
+sentencepiece
+protobuf
+safetensors
+
+# Data Processing & Math
+numpy
+pandas
+scipy
+scikit-learn
+sympy
+pyarrow
+jsonlines
+
+# Configuration & Logging
+PyYAML
+tqdm
+wandb
+matplotlib
+
+# Optional/System
+psutil
+packaging
