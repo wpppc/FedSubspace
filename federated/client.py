@@ -141,3 +141,7 @@ class FedSubspaceClient:
 
     def load_theta(self, theta):
         self.model.adapter.theta_s.data.copy_(theta.to(self.device))
+        # FIX: Reset Gate to 0.0 to avoid leakage between clients in simulation
+        # and to ensure training starts from the provided theta (Base + Theta).
+        for g in self.model.get_gate_params():
+            g.data.fill_(0.0)
