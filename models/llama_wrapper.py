@@ -17,9 +17,8 @@ class SubspaceLoRALinear(nn.Module):
         self.adapter_ref = [adapter]
         
         # Adaptive Zero-Initialization Gate
-        # Initialize to a larger value (0.5) so tanh(gate) is ~0.46, allowing better gradient flow
-        # tanh(0.1) is only 0.1, which dampens gradients by 10x compared to standard LoRA
-        self.gate = nn.Parameter(torch.tensor(0.5))
+        # Initialize to 0.0 to start from pure Base Model.
+        self.gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
         # Original output

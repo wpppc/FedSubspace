@@ -39,34 +39,14 @@ class FedAltClientOrtho:
         self.model.adapter_global.theta_s.requires_grad_(False)
         
         # 2. Load Local State (Trainable Theta + Gates)
-        if os.path.exists(self.local_state_path):
-            state = torch.load(self.local_state_path, map_location=self.device)
-            self.model.adapter_local.theta_s.data.copy_(state['theta'])
-            
-            # Load Local Gates
-            if 'gates' in state:
-                for name, val in state['gates'].items():
-                    self._set_param_by_name(name, val)
-        else:
-            # First round or missing local state
-            # Check if global_theta is Zero (Identity). If so, keep Local as Random (from init) to avoid Deadlock.
-            # If Global is learned (non-zero), initialize Local from Global.
-            if global_theta.abs().sum() == 0:
-                # Global is Zero (Identity). Keep Local as Random (initialized in wrapper).
-                pass
-            else:
-                # Global has knowledge. Initialize Local from Global.
-                # FIX: Do NOT copy Global to Local. Reset Local to Random Noise to avoid "Destructive Rotation".
-                # We want Local to learn the *residual* (what Global missed), not start from Global.
-                self.model.adapter_local.theta_s.data.normal_(0, 0.02)
-                
-                # Reset Gate to 0 to ensure we start from Global (Base + Global + 0*Local)
-                # This allows Local to grow gradually via gradients.
-                for module in self.model.modules():
-                    if hasattr(module, "gate_l"):
-                        module.gate_l.data.fill_(0.0)
-            
-            # Gates remain at default initialization (0.0 for gate_l)
+        # FIX: Always reset Local State to Random Noise to avoid "Destructive Rotation".
+        # We do NOT load previous local state or copy global state.
+        self.model.adapter_local.theta_s.data.normal_(0, 0.02)
+        
+        # Reset Gate to 0.0
+        for module in self.model.modules():
+            if hasattr(module, "gate_l"):
+                module.gate_l.data.fill_(0.0)
             
         self.model.adapter_local.theta_s.requires_grad_(True)
 

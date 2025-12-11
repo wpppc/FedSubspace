@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=$GPU_ID
 mkdir -p outputs/fed_alt_ortho
 
 # Run the script
-python main_alt_ortho.py > fed_alt_ortho.log 2>&1 &
+/home/wuqicen/anaconda3/envs/fedsubspace/bin/python main_alt_ortho.py > fed_alt_ortho.log 2>&1 &
 
 PID=$!
 echo "Training started with PID: $PID"
