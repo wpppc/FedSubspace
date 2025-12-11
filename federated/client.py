@@ -58,7 +58,8 @@ class FedSubspaceClient:
             logging_steps=10,
             save_strategy="no",
             report_to=[],
-            use_cpu=False
+            use_cpu=False,
+            remove_unused_columns=False
         )
 
         trainer = transformers.Trainer(
