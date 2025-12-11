@@ -6,7 +6,7 @@ class FedSubspaceServer:
     def __init__(self, d_s):
         self.global_theta = torch.zeros(d_s)
 
-    def aggregate(self, updates, sizes):
+    def aggregate(self, updates, sizes, update_state=True):
         """
         Aggregates updates which can be:
         1. A list of tensors (FedSubspace)
@@ -17,7 +17,8 @@ class FedSubspaceServer:
         # Case 1: List of Tensors
         if isinstance(updates[0], torch.Tensor):
             result = sum([theta * (n/total) for theta,n in zip(updates, sizes)])
-            self.global_theta = result.clone()
+            if update_state:
+                self.global_theta = result.clone()
             return result
             
         # Case 2: List of Dicts (FedALT)
@@ -39,12 +40,13 @@ class FedSubspaceServer:
                     aggregated[k] = val
             
             # Update global state if it matches structure
-            if hasattr(self, 'global_state'):
-                self.global_state = aggregated
-            else:
-                # For backward compatibility, if 'theta' is the main key
-                if 'theta' in aggregated:
-                    self.global_theta = aggregated['theta'].clone()
+            if update_state:
+                if hasattr(self, 'global_state'):
+                    self.global_state = aggregated
+                else:
+                    # For backward compatibility, if 'theta' is the main key
+                    if 'theta' in aggregated:
+                        self.global_theta = aggregated['theta'].clone()
             
             return aggregated
         

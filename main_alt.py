@@ -249,18 +249,25 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
             print(f"Training Client {cid}...")
             
             # Calculate RoW Global State for this client
-            if r == 0 or any(u is None for u in server.previous_updates):
+            if r == 0:
                 # Round 0: Use the unified global state
                 client_global_state = server.global_state
             else:
-                # Round > 0: Calculate RoW = (Sum_All - Self) / (K-1)
-                sum_theta = torch.zeros_like(server.previous_updates[0]['theta'])
+                # Round > 0: 
+                # We need: Client Global = (Server History) + (Average of Others' Residuals)
+                
+                # 1. Calculate Sum of Residuals from previous round
+                sum_residuals = torch.zeros_like(server.previous_updates[0]['theta'])
                 for u in server.previous_updates:
                     if u is not None:
-                        sum_theta += u['theta']
+                        sum_residuals += u['theta']
                 
-                self_theta = server.previous_updates[cid]['theta']
-                row_theta = (sum_theta - self_theta) / (cfg["data"]["num_clients"] - 1)
+                # 2. Calculate RoW Residual (Exclude self)
+                self_residual = server.previous_updates[cid]['theta']
+                row_residual_avg = (sum_residuals - self_residual) / (cfg["data"]["num_clients"] - 1)
+                
+                # 3. Add to Server History
+                row_theta = server.global_state['theta'] + row_residual_avg
                 
                 client_global_state = {
                     'theta': row_theta,
@@ -295,8 +302,21 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                 server.previous_updates[cid] = thetas_to_aggregate[current_update_idx]
                 current_update_idx += 1
 
-        # Server aggregates Local Vectors to update Global Vector
-        new_global_state = server.aggregate(thetas_to_aggregate, sizes)
+        # Server aggregates Local Vectors (Residuals)
+        # We use update_state=False because we want to manually accumulate
+        avg_update = server.aggregate(thetas_to_aggregate, sizes, update_state=False)
+        
+        # Accumulate Residuals into Global History
+        # Global(t) = Global(t-1) + Avg(Residuals)
+        new_global_theta = server.global_state['theta'] + avg_update['theta']
+        
+        # Update Server State
+        server.global_state = {
+            'theta': new_global_theta,
+            'gates': avg_update['gates'] # Gates are averaged (replacement), not accumulated
+        }
+        
+        new_global_state = server.global_state
         torch.save(new_global_state, os.path.join(cfg["output_dir"], f"theta_global_round{r}.pt"))
         
         # Evaluate (Using the new Global Vector as the "Global Model")

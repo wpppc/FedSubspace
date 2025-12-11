@@ -295,33 +295,30 @@ def main():
             dl, collator = dl_info
             
             # Calculate RoW Global State for this client
-            if r == 0 or any(u is None for u in server.previous_updates):
+            if r == 0:
                 # Round 0: Use the unified global state (Average of All, or Initial)
                 client_global_state = server.global_state
             else:
-                # Round > 0: Calculate RoW = (Sum_All - Self) / (K-1)
-                # 1. Reconstruct Sum_All from server.global_state (which is Average)
-                # Sum_All = Average * K
-                # But wait, server.global_state might be weighted average.
-                # Let's do it properly: Sum individual updates.
+                # Round > 0: 
+                # We need: Client Global = (Server History) + (Average of Others' Residuals)
                 
-                # Sum all theta
-                sum_theta = torch.zeros_like(server.previous_updates[0]['theta'])
+                # 1. Calculate Sum of Residuals from previous round
+                sum_residuals = torch.zeros_like(server.previous_updates[0]['theta'])
                 for u in server.previous_updates:
                     if u is not None:
-                        sum_theta += u['theta']
+                        sum_residuals += u['theta']
                 
-                # Subtract self
-                self_theta = server.previous_updates[cid]['theta']
-                row_theta = (sum_theta - self_theta) / (cfg["data"]["num_clients"] - 1)
+                # 2. Calculate RoW Residual (Exclude self)
+                self_residual = server.previous_updates[cid]['theta']
+                row_residual_avg = (sum_residuals - self_residual) / (cfg["data"]["num_clients"] - 1)
                 
-                # Gates: We can also do RoW for gates if we want, or just use Global Average.
-                # For simplicity and stability, let's use Global Average for Gates, 
-                # because Gates are structural parameters, not knowledge parameters.
-                # Or we can do RoW for gates too. Let's stick to Global Average for Gates for now to avoid complexity.
+                # 3. Add to Server History
+                # server.global_state['theta'] holds the accumulated history up to Round r-1
+                row_theta = server.global_state['theta'] + row_residual_avg
+                
                 client_global_state = {
                     'theta': row_theta,
-                    'gates': server.global_state['gates']
+                    'gates': server.global_state['gates'] # Gates are just averaged, not accumulated
                 }
 
             # Instantiate client on the fly
@@ -373,9 +370,9 @@ def main():
         print(f" Aggregating...", flush=True)
         
         # Manual Aggregation for Theta AND Gates
-        # 1. Aggregate Theta
+        # 1. Aggregate Theta (Residuals)
         total_samples = sum(sizes)
-        agg_theta = torch.zeros_like(thetas_to_aggregate[0]['theta'])
+        avg_residual = torch.zeros_like(thetas_to_aggregate[0]['theta'])
         
         # 2. Aggregate Gates
         # Initialize agg_gates with zeros based on first client's structure
@@ -387,18 +384,23 @@ def main():
         for update, size in zip(thetas_to_aggregate, sizes):
             weight = size / total_samples
             
-            # Theta
-            agg_theta += update['theta'] * weight
+            # Theta (Residual)
+            avg_residual += update['theta'] * weight
             
             # Gates
             for k in agg_gates.keys():
                 if k in update['gates']:
                     agg_gates[k] += update['gates'][k] * weight
         
+        # Accumulate Residuals into Global History
+        # Global(t) = Global(t-1) + Avg(Residuals)
+        # Note: server.global_state['theta'] is the history from previous round
+        new_global_theta = server.global_state['theta'] + avg_residual
+
         # Update Server State
         server.global_state = {
-            'theta': agg_theta,
-            'gates': agg_gates
+            'theta': new_global_theta,
+            'gates': agg_gates # Gates are averaged (replacement), not accumulated
         }
         
         # Save Checkpoint
