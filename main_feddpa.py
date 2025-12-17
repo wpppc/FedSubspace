@@ -1,359 +1,245 @@
-
-# ----------------------------------------------------------------
-# 1. Init
-# ----------------------------------------------------------------
 import os
+# [防死锁] 必须在 torch 之前
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys
-import time
-import re
-import csv
-import json
-import gc
-import copy
 import yaml
+import torch
+import json
+import csv
+import time
+import gc
+import re
 import math
+from tqdm import tqdm
 from collections import Counter
 
-print(">> [Init] Importing PyTorch & Transformers...", flush=True)
-import torch
-from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
+from transformers import AutoTokenizer
 
-# Custom Modules
+# Custom modules
 from data.dataset_tasks import GenericGenDataset, GenCollator
 from models.llama_wrapper_dpa import FedDPAModelWrapper
 from federated.client_dpa import FedDPAClient
-from models.lora_utils import extract_lora_shapes
 
-print(">> [Init] Libraries loaded.", flush=True)
+# --- [关键修复] 禁用 SDPA 防止 RecursionError ---
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
+CLIENT_TASK_MAPPING = {
+    0: "Sentiment Analysis", 1: "Natural Language Inference", 2: "Text Classification",
+    3: "Commonsense Reasoning", 4: "Paraphrase Detection", 5: "Struct to Text",
+    6: "Reading Comprehension", 7: "Coreference Resolution"
+}
+
+def compute_rouge1(prediction, reference):
+    pred_tokens = re.findall(r'\w+', prediction.lower())
+    ref_tokens = re.findall(r'\w+', reference.lower())
+    if not pred_tokens or not ref_tokens: return 0.0
+    pred_counts = Counter(pred_tokens)
+    ref_counts = Counter(ref_tokens)
+    overlap = sum((pred_counts & ref_counts).values())
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    if precision + recall == 0: return 0.0
+    return 2 * (precision * recall) / (precision + recall)
+
+def update_summary_csv(output_dir, round_num, client_scores):
+    summary_file = os.path.join(output_dir, "summary_table.csv")
+    columns = ["Method", "Round"] + sorted(list(set(CLIENT_TASK_MAPPING.values()))) + ["Average"]
+    file_exists = os.path.exists(summary_file)
+    row_data = {"Method": "FedDPA", "Round": round_num, "Average": 0.0}
+    
+    total = 0
+    for cid, score in client_scores.items():
+        task = CLIENT_TASK_MAPPING.get(cid, f"Client {cid}")
+        row_data[task] = f"{score * 100:.2f}"
+        total += score
+    if len(client_scores) > 0:
+        row_data["Average"] = f"{(total / len(client_scores)) * 100:.2f}"
+    
+    with open(summary_file, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        if not file_exists: writer.writeheader()
+        writer.writerow(row_data)
 
 def get_trainable_parameters(model):
-    """
-    Returns (trainable_params, all_param)
-    """
     trainable_params = 0
     all_param = 0
     for _, param in model.named_parameters():
         num_params = param.numel()
-        # if using DS Zero 3 and the weights are initialized empty
-        if num_params == 0 and hasattr(param, "ds_numel"):
-            num_params = param.ds_numel
-
-        # Due to the design of 4bit linear layers from bitsandbytes
-        if param.__class__.__name__ == "Params4bit":
-            num_params = num_params * 2
-
+        if num_params == 0 and hasattr(param, "ds_numel"): num_params = param.ds_numel
+        if param.__class__.__name__ == "Params4bit": num_params = num_params * 2
         all_param += num_params
-        if param.requires_grad:
-            trainable_params += num_params
-    
+        if param.requires_grad: trainable_params += num_params
     return trainable_params, all_param
 
-def compute_rouge1(prediction, reference):
-    """
-    Robust ROUGE-1 F1 score (Local implementation, no network required).
-    """
-    # Simple tokenizer
-    def get_tokens(text):
-        return re.findall(r'\w+', text.lower())
-
-    pred_tokens = get_tokens(prediction)
-    ref_tokens = get_tokens(reference)
-
-    if not pred_tokens or not ref_tokens:
-        return 0.0
-
-    # Use Counter to handle word frequency correctly
-    pred_counts = Counter(pred_tokens)
-    ref_counts = Counter(ref_tokens)
-    
-    # Calculate overlap count
-    overlap = sum((pred_counts & ref_counts).values())
-
-    precision = overlap / len(pred_tokens)
-    recall = overlap / len(ref_tokens)
-
-    if precision + recall == 0:
-        return 0.0
-    
-    f1 = 2 * (precision * recall) / (precision + recall)
-    return f1
-
-# Task Mapping
-CLIENT_TASK_MAPPING = {
-    0: "Sentiment Analysis",
-    1: "Natural Language Inference",
-    2: "Text Classification",
-    3: "Commonsense Reasoning",
-    4: "Paraphrase Detection",
-    5: "Struct to Text",
-    6: "Reading Comprehension",
-    7: "Coreference Resolution"
-}
-
-def update_summary_csv(output_dir, method_name, round_num, client_scores):
-    summary_file = os.path.join(output_dir, "summary_table.csv")
-    task_columns = sorted(list(set(CLIENT_TASK_MAPPING.values())))
-    columns = ["Method", "Round"] + task_columns + ["Average"]
-    file_exists = os.path.exists(summary_file)
-    
-    row_data = {
-        "Method": method_name,
-        "Round": round_num,
-        "Average": 0.0
-    }
-    
-    total_score = 0
-    count = 0
-    for cid, score in client_scores.items():
-        task_name = CLIENT_TASK_MAPPING.get(cid, f"Client {cid}")
-        row_data[task_name] = f"{score * 100:.2f}"
-        total_score += score
-        count += 1
-        
-    if count > 0:
-        row_data["Average"] = f"{(total_score / count) * 100:.2f}"
-    
-    with open(summary_file, mode='a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row_data)
-    print(f">> [Summary] Updated {summary_file}")
-
 def main():
-    # 1. Load Config
-    config_path = "configs/fedsubspace_flan.yaml"
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    
-    # Override output dir for FedDPA
-    cfg["output_dir"] = "outputs/fed_dpa"
+    # 1. Config
+    cfg_path = "configs/fedsubspace_flan.yaml"
+    cfg = yaml.safe_load(open(cfg_path, "r"))
+    cfg["output_dir"] = "outputs/fed_dpa" # Distinct output dir
     os.makedirs(cfg["output_dir"], exist_ok=True)
     
-    print(f">> [Main] Output Dir: {cfg['output_dir']}")
+    # [关键对齐] 
+    # Batch Size = 1 (to save memory for Dual Adapters)
+    # Accumulation = 16 (Total Batch = 16, Same as FedLESS)
+    batch_size = 1
+    grad_accum = 16
+    lr = 2e-4 # Same as FedLESS
     
-    # 2. Load Base Model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Auto-select best dtype
-    torch_dtype = torch.float16
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        print(">> [Main] bfloat16 supported. Using bfloat16 for stability.", flush=True)
-        torch_dtype = torch.bfloat16
-    
-    print(f">> [Main] Loading Base Model: {cfg['model']['path']}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["path"], use_fast=False)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    # Force model to load on the correct device without splitting across GPUs
-    # device_map="auto" allows splitting across multiple GPUs
-    base_model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"]["path"],
-        torch_dtype=torch_dtype,
-        device_map="auto" # Enable multi-GPU splitting
-    )
-    
-    # Enable Gradient Checkpointing to save memory
-    base_model.gradient_checkpointing_enable()
-    base_model.enable_input_require_grads()
-    
-    # Freeze Base Model
-    for param in base_model.parameters():
-        param.requires_grad = False
-    
-    # Override batch size to 1 to prevent OOM
-    cfg["train"]["batch_size"] = 1
-    print(f">> [Main] Batch Size set to {cfg['train']['batch_size']} to prevent OOM")
-    
-    # 3. Initialize FedDPA Wrapper
-    print(">> [Main] Initializing FedDPAModelWrapper...")
-    shared_model = FedDPAModelWrapper(
-        base_model,
-        lora_r=cfg["lora"]["r"],
-        lora_alpha=16,
-        lora_dropout=0.05,
-        target_modules=cfg["lora"]["target_modules"]
-    )
+    print(f">> [Config] Batch: {batch_size}, Accum: {grad_accum}, LR: {lr}")
 
-    # Calculate params for logging
+    # 2. Model & Tokenizer
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["path"])
+    tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+    
+    # Shared Model (Wrapper)
+    shared_model = FedDPAModelWrapper(
+        cfg["model"]["path"],
+        lora_r=cfg["lora"]["r"],
+        target_modules=cfg["lora"]["target_modules"],
+        torch_dtype=torch_dtype
+    )
+    
+    # Calculate Params
     trainable_params, all_param = get_trainable_parameters(shared_model)
-    lora_shapes = extract_lora_shapes(base_model, target_modules=cfg["lora"]["target_modules"], r=cfg["lora"]["r"])
-    full_lora_params = sum(A.numel() + B.numel() for A, B in lora_shapes.values())
-    subspace_params = full_lora_params # FedDPA operates in the full LoRA space
+    subspace_params = 0 # FedDPA doesn't use subspace
+    full_lora_params = trainable_params # Approx
     
-    print(f"Full LoRA Params (Theoretical): {full_lora_params:,}")
-    print(f"Subspace Params (Equivalent): {subspace_params:,}")
-    print(f"Trainable Params (Actual): {trainable_params:,}")
-    print(f"All Params: {all_param:,}")
-    print(f"Trainable Ratio: {100 * trainable_params / all_param:.4f}%")
-    
-    # 4. Initialize Server State (Global Adapter)
-    # We store the state dict of the global adapter
+    # 3. Server State (Global Adapter Only)
     server_global_state = shared_model.get_global_state_dict()
     
-    # 5. Load Datasets
-    print(f">> [Main] Loading Datasets...", flush=True)
+    # 4. Data
     client_dataloaders = []
     for cid in range(cfg["data"]["num_clients"]):
         data_path = os.path.join(cfg["data"]["root"], f"client_{cid}.json")
         if not os.path.exists(data_path):
-            client_dataloaders.append(None)
-            continue
+            client_dataloaders.append(None); continue
         ds = GenericGenDataset(data_path)
-        collator = GenCollator(tokenizer, max_len=cfg["data"]["cutoff_len"], train_on_inputs=cfg["data"]["train_on_inputs"])
-        dl = DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=True, collate_fn=lambda b: collator(b), num_workers=0)
+        collator = GenCollator(tokenizer, max_len=cfg["data"]["cutoff_len"], train_on_inputs=False)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: collator(b), num_workers=0)
         client_dataloaders.append((dl, collator))
-        
-    # CSV Init
-    csv_file = os.path.join(cfg["output_dir"], "experiment_results.csv")
-    if not os.path.exists(csv_file):
-        with open(csv_file, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Timestamp", "BaseModel", "Dataset", "Round", "Metric", "Value", "SubspaceParams", "FullLoRAParams", "TrainableParams", "AllParams", "TrainableRatio"])
+
+    # 5. Resume Logic
+    start_round = 0
+    checkpoint_pattern = re.compile(r"global_round(\d+).pt")
+    checkpoints = [int(m.group(1)) for f in os.listdir(cfg["output_dir"]) if (m := checkpoint_pattern.match(f))]
+    
+    if checkpoints:
+        last_round = max(checkpoints)
+        ckpt_path = os.path.join(cfg["output_dir"], f"global_round{last_round}.pt")
+        print(f">> [Resume] Loading checkpoint: {ckpt_path}")
+        server_global_state = torch.load(ckpt_path, map_location="cpu")
+        start_round = last_round + 1
 
     # 6. Training Loop
-    initial_lr = float(cfg["train"]["lr"])
-    min_lr = 1e-6
-    warmup_rounds = 0
+    rounds = cfg["federated"]["rounds"]
+    # [关键对齐] Warmup Rounds = 1 (Same as FedLESS)
+    warmup_rounds = 1 
     
-    for r in range(cfg["federated"]["rounds"]):
-        print(f"\n=== Round {r} (FedDPA) ===", flush=True)
+    # CSV Init
+    csv_path = os.path.join(cfg["output_dir"], "experiment_results.csv")
+    if not os.path.exists(csv_path):
+        with open(csv_path, 'w') as f:
+            csv.writer(f).writerow(["Timestamp", "BaseModel", "Dataset", "Round", "Metric", "Value", "SubspaceParams", "FullLoRAParams", "TrainableParams", "AllParams", "TrainableRatio"])
+
+    for r in range(start_round, rounds):
+        print(f"\n=== Round {r} (FedDPA) ===")
         
-        # LR Scheduler
+        # LR Schedule
         if r < warmup_rounds:
-            current_lr = initial_lr
+            current_lr = lr * (r + 1) / warmup_rounds
         else:
-            progress = (r - warmup_rounds) / (cfg["federated"]["rounds"] - warmup_rounds)
-            current_lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + math.cos(progress * math.pi))
+            progress = (r - warmup_rounds) / (rounds - warmup_rounds)
+            current_lr = 1e-6 + 0.5 * (lr - 1e-6) * (1 + math.cos(progress * math.pi))
+        
         print(f"Current LR: {current_lr:.2e}")
         
-        global_updates = []
+        updates = []
         sizes = []
         
         # Train Clients
         for cid, dl_info in enumerate(client_dataloaders):
-            if dl_info is None: continue
+            if not dl_info: continue
             dl, collator = dl_info
             
             client = FedDPAClient(
-                client_id=cid,
-                model=shared_model,
-                tokenizer=tokenizer,
-                dataloader=dl,
-                output_dir=cfg["output_dir"],
-                local_epochs=cfg["train"]["local_epochs"],
-                lr=current_lr,
-                device=base_model.device, # Use model's device
-                data_collator=collator,
-                dtype=torch_dtype
+                client_id=cid, model=shared_model, tokenizer=tokenizer, 
+                dataloader=dl, output_dir=cfg["output_dir"],
+                local_epochs=cfg["train"]["local_epochs"], lr=current_lr,
+                dtype=torch_dtype, gradient_accumulation_steps=grad_accum
             )
             
-            # Load Global & Local
+            # Load State (Global + Local)
             client.load_state(server_global_state)
             
             # Train
             client.train()
             
-            # Get Update (Global only)
-            global_updates.append(client.get_update_for_server())
+            # Collect Global Update
+            updates.append(client.get_update_for_server())
             sizes.append(len(dl.dataset))
             
             # Cleanup
-            client.model = None
-            del client
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"Client {cid} done.", flush=True)
-            
-        # Aggregate Global Updates
-        print(f" Aggregating...", flush=True)
+            client.model = None; del client; gc.collect(); torch.cuda.empty_cache()
+        
+        # Aggregate
+        print("Aggregating...")
         total_samples = sum(sizes)
-        
-        # Initialize aggregated state with zeros
-        agg_state = {}
-        first_update = global_updates[0]
-        for k in first_update.keys():
-            agg_state[k] = torch.zeros_like(first_update[k])
-            
-        for update, size in zip(global_updates, sizes):
+        agg_state = {k: torch.zeros_like(v) for k, v in updates[0].items()}
+        for update, size in zip(updates, sizes):
             weight = size / total_samples
-            for k in agg_state.keys():
+            for k in agg_state:
                 agg_state[k] += update[k] * weight
-                
-        server_global_state = agg_state
         
-        # Save Checkpoint
+        server_global_state = agg_state
         torch.save(server_global_state, os.path.join(cfg["output_dir"], f"global_round{r}.pt"))
         
-        # Evaluation (Personalized)
-        # We need to evaluate each client using their PERSONALIZED model (Global + Local)
-        # Since we just trained them, the local state on disk is up to date.
-        # We need to reload the model for each client to evaluate.
-        
-        if r % 1 == 0: # Eval every round
-            print(f" Evaluating Personalized Models...", flush=True)
+        # Evaluation
+        if r % cfg["eval"].get("eval_every", 1) == 0:
+            print("Evaluating...")
             client_scores = {}
             
             for cid in range(cfg["data"]["num_clients"]):
                 test_path = os.path.join(cfg["data"]["root"], f"test_{cid}.json")
                 if not os.path.exists(test_path): continue
                 
-                # Load Test Data
-                with open(test_path, "r") as f:
-                    test_data = json.load(f)
-                if cfg["eval"]["max_samples"]: 
-                    test_data = test_data[:cfg["eval"]["max_samples"]]
-                
-                # Setup Client Model for Eval
-                # Load Global
-                shared_model.load_state_dict(server_global_state, strict=False)
-                # Load Local
-                local_state_path = os.path.join(cfg["output_dir"], f"client_{cid}_local_state.pt")
-                if os.path.exists(local_state_path):
-                    local_state = torch.load(local_state_path, map_location=device)
-                    shared_model.load_state_dict(local_state, strict=False)
-                else:
-                    # If no local state (shouldn't happen after training), init from global
-                    for module in shared_model.base_model.modules():
-                        if hasattr(module, "adapter_global") and hasattr(module, "adapter_local"):
-                            module.adapter_local.lora_A.data.copy_(module.adapter_global.lora_A.data)
-                            module.adapter_local.lora_B.data.copy_(module.adapter_global.lora_B.data)
+                # Load correct state for eval (Global + Persistent Local)
+                shared_model.load_global_state_dict(server_global_state)
+                local_path = os.path.join(cfg["output_dir"], f"client_{cid}_local_state.pt")
+                if os.path.exists(local_path):
+                    shared_model.load_local_state_dict(torch.load(local_path))
                 
                 shared_model.eval()
                 
-                c_scores = []
-                for ex in tqdm(test_data, desc=f"Client {cid} Eval", leave=False):
-                    raw_input = ex["input"]
-                    prompt = f"### Instruction:\n{raw_input}\n\n### Response:\n"
-                    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        outputs = base_model.generate(**inputs, max_new_tokens=50, pad_token_id=tokenizer.eos_token_id)
-                    input_len = inputs["input_ids"].shape[1]
-                    pred = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-                    if "###" in pred: pred = pred.split("###")[0]
-                    pred = pred.strip()
-                    c_scores.append(compute_rouge1(pred, ex["output"]))
+                # Inference
+                with open(test_path, "r") as f: data = json.load(f)[:100] # Limit 100
                 
-                avg_score = sum(c_scores)/len(c_scores) if c_scores else 0
-                client_scores[cid] = avg_score
-                task_name = CLIENT_TASK_MAPPING.get(cid, f"Client {cid}")
-                print(f"  {task_name}: {avg_score:.4f}")
-
-                # Log individual client score to main CSV
-                with open(csv_file, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "llama-2-7b",
-                        f"FedDPA ({task_name})",
-                        r,
-                        "ROUGE-1",
-                        avg_score,
+                scores = []
+                for ex in tqdm(data, desc=f"Client {cid}", leave=False):
+                    prompt = f"### Instruction:\n{ex['input']}\n\n### Response:\n"
+                    inputs = tokenizer(prompt, return_tensors="pt").to(shared_model.base_model.device)
+                    with torch.no_grad():
+                        out = shared_model.base_model.generate(**inputs, max_new_tokens=50, pad_token_id=tokenizer.eos_token_id)
+                    pred = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).split("###")[0].strip()
+                    scores.append(compute_rouge1(pred, ex["output"]))
+                
+                avg = sum(scores)/len(scores) if scores else 0
+                client_scores[cid] = avg
+                t_name = CLIENT_TASK_MAPPING.get(cid, f"Client {cid}")
+                print(f"  {t_name}: {avg:.4f}")
+                
+                with open(csv_path, 'a') as f:
+                    csv.writer(f).writerow([
+                        time.strftime("%Y-%m-%d %H:%M:%S"), 
+                        os.path.basename(cfg["model"]["path"]), 
+                        f"FedDPA ({t_name})", 
+                        r, 
+                        "ROUGE-1", 
+                        avg,
                         subspace_params,
                         full_lora_params,
                         trainable_params,
@@ -361,7 +247,7 @@ def main():
                         f"{100 * trainable_params / all_param:.4f}%"
                     ])
             
-            update_summary_csv(cfg["output_dir"], "FedDPA", r, client_scores)
+            update_summary_csv(cfg["output_dir"], r, client_scores)
 
 if __name__ == "__main__":
     main()

@@ -18,7 +18,7 @@ class FedSubspaceClient:
     - save only theta_s update
     """
 
-    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, lr=5e-4, device="cuda", data_collator=None, dtype=torch.float16):
+    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, lr=5e-4, device="cuda", data_collator=None, dtype=torch.float16, batch_size=2, gradient_accumulation_steps=1):
         self.client_id = client_id
         self.model = model  # same shared base model wrapper
         self.tokenizer = tokenizer
@@ -29,6 +29,8 @@ class FedSubspaceClient:
         self.data_collator = data_collator
         self.dtype = dtype
         self.lr = lr
+        self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
 
         # Optimizer ONLY for theta_s
         self.optim_params = [self.model.adapter.theta_s]
@@ -48,8 +50,8 @@ class FedSubspaceClient:
 
         args = transformers.TrainingArguments(
             output_dir=os.path.join(self.output_dir, f"client_{self.client_id}"),
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=1,
+            per_device_train_batch_size=self.batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.lr,
             num_train_epochs=self.local_epochs,
             optim="adamw_torch",

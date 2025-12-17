@@ -1,16 +1,14 @@
 import torch
 from torch.optim import AdamW
 import os
-import gc
 from tqdm import tqdm
 
-class FedDPAClient:
-    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, 
-                 local_epochs=1, lr=2e-4, device="cuda", dtype=torch.float16, 
+class FedTTClient:
+    def __init__(self, client_id, model, dataloader, output_dir, 
+                 local_epochs=2, lr=2e-4, device="cuda", dtype=torch.float16,
                  gradient_accumulation_steps=1):
         self.client_id = client_id
         self.model = model
-        self.tokenizer = tokenizer
         self.dataloader = dataloader
         self.output_dir = output_dir
         self.local_epochs = local_epochs
@@ -18,38 +16,19 @@ class FedDPAClient:
         self.device = device
         self.dtype = dtype
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        
-        self.local_state_path = os.path.join(output_dir, f"client_{client_id}_local_state.pt")
-
-    def load_state(self, global_state_dict):
-        # 1. Load Global
-        self.model.load_global_state_dict(global_state_dict)
-        
-        # 2. Load Local (Persistent)
-        if os.path.exists(self.local_state_path):
-            local_state = torch.load(self.local_state_path, map_location=self.device)
-            self.model.load_local_state_dict(local_state)
-        else:
-            # First round: Init Local from Global (Standard FedDPA practice)
-            print(f"  [Client {self.client_id}] First run, syncing Local <= Global")
-            for module in self.model.base_model.modules():
-                if hasattr(module, "adapter_global") and hasattr(module, "adapter_local"):
-                    module.adapter_local.lora_A.data.copy_(module.adapter_global.lora_A.data)
-                    module.adapter_local.lora_B.data.copy_(module.adapter_global.lora_B.data)
 
     def train(self):
-        # Train BOTH Global and Local adapters
+        # Only train TT parameters
         params = [p for n, p in self.model.named_parameters() if p.requires_grad]
         optimizer = AdamW(params, lr=self.lr)
         
         self.model.train()
         scaler = torch.amp.GradScaler('cuda', enabled=(self.dtype == torch.float16))
         
-        global_step = 0
         optimizer.zero_grad()
         
         for epoch in range(self.local_epochs):
-            with tqdm(self.dataloader, desc=f"Client {self.client_id} (FedDPA)", leave=False) as pbar:
+            with tqdm(self.dataloader, desc=f"Client {self.client_id} (FedTT)", leave=False) as pbar:
                 for step, batch in enumerate(pbar):
                     input_ids = batch["input_ids"].to(self.device)
                     attention_mask = batch["attention_mask"].to(self.device)
@@ -60,28 +39,19 @@ class FedDPAClient:
                         loss = outputs.loss / self.gradient_accumulation_steps
                     
                     if torch.isnan(loss):
-                        print("NaN loss ignored.")
                         optimizer.zero_grad()
                         continue
 
                     scaler.scale(loss).backward()
                     
-                    # Accumulate gradients
                     if (step + 1) % self.gradient_accumulation_steps == 0 or (step + 1) == len(self.dataloader):
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(params, 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
-                        global_step += 1
                         
-                        # Logging (restore scale)
                         pbar.set_postfix(loss=f"{loss.item() * self.gradient_accumulation_steps:.4f}")
 
-        # Save Local State to Disk immediately
-        local_state = self.model.get_local_state_dict()
-        torch.save(local_state, self.local_state_path)
-
     def get_update_for_server(self):
-        # Only send Global Adapter to Server
-        return self.model.get_global_state_dict()
+        return self.model.get_trainable_state_dict()

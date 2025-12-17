@@ -6,7 +6,7 @@ import transformers
 import shutil
 
 class FedAltClient:
-    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, max_steps=-1, lr=5e-4, device="cuda", data_collator=None, dtype=torch.float16):
+    def __init__(self, client_id, model, tokenizer, dataloader, output_dir, local_epochs=1, max_steps=-1, lr=5e-4, device="cuda", data_collator=None, dtype=torch.float16, gradient_accumulation_steps=1):
         self.client_id = client_id
         self.model = model  # FedDualSubspaceModelWrapper
         self.tokenizer = tokenizer
@@ -18,6 +18,7 @@ class FedAltClient:
         self.device = device
         self.data_collator = data_collator
         self.dtype = dtype
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         # Persistent Local Vector Path
         self.local_state_path = os.path.join(output_dir, f"client_{client_id}_local_state.pt")
@@ -51,11 +52,11 @@ class FedAltClient:
         self.model.adapter_global.theta_s.requires_grad_(False)
         
         # 2. Load Local State (Trainable Theta + Gates)
-        # FIX: Always reset Local State to Random Noise to avoid "Destructive Rotation".
-        # We do NOT load previous local state or copy global state.
+        # FedAlt (Ablation): Reset to Random Noise (normal_(0, 0.02))
+        # No Gram-Schmidt here.
         self.model.adapter_local.theta_s.data.normal_(0, 0.02)
         
-        # Reset Gate to 0.0
+        # Reset Gate to 0.0 (Strict Zero)
         for module in self.model.modules():
             if hasattr(module, "gate_l"):
                 module.gate_l.data.fill_(0.0)
@@ -200,12 +201,35 @@ class FedAltClient:
     def get_update_for_server(self):
         # Return Theta and Gates for aggregation
         gates = {}
+        gate_values = [] # Store tanh(gate_l) values
+        
         for name, module in self.model.named_modules():
             if hasattr(module, "gate_g"):
                 gates[f"{name}.gate_g"] = module.gate_g.detach().cpu()
+            
+            if hasattr(module, "gate_l"):
                 gates[f"{name}.gate_l"] = module.gate_l.detach().cpu()
+                # Collect effective gate value
+                gate_val = torch.tanh(module.gate_l).detach().item()
+                gate_values.append(gate_val)
+        
+        # [Scale Mismatch Fix]
+        # Bake-in the average gate scale into the vector
+        if len(gate_values) > 0:
+            avg_gate_scale = sum(gate_values) / len(gate_values)
+        else:
+            avg_gate_scale = 0.0
+            
+        print(f">> [Client {self.client_id}] Average Gate Scale: {avg_gate_scale:.4f}")
+
+        # Get raw theta
+        raw_theta = self.model.adapter_local.theta_s.detach().cpu().clone()
+        
+        # Scale it so Server receives the "Effective Residual"
+        # Next round Global Gate is 1.0, so this matches the magnitude.
+        scaled_theta = raw_theta * avg_gate_scale
         
         return {
-            'theta': self.model.adapter_local.theta_s.detach().cpu().clone(),
+            'theta': scaled_theta,
             'gates': gates
         }

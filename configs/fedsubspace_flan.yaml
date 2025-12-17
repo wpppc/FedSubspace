@@ -1,4 +1,4 @@
-output_dir: "outputs/fedsubspace_flan"
+output_dir: "outputs/fedless"
 
 model:
   path: "/home/wuqicen/base_models/llama2-7b/LLM-Research/llama-2-7b"
@@ -27,9 +27,9 @@ train:
   batch_size: 2
   gradient_accumulation_steps: 8
   local_epochs: 5
-  lr: 3e-4
+  lr: 2e-4
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.03
+  warmup_ratio: 0.1
 
 eval:
   enabled: true

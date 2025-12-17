@@ -1,8 +1,7 @@
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
+from transformers import AutoModelForCausalLM
 
 class LoRALinear(nn.Module):
     def __init__(self, in_features, out_features, r=8, alpha=16, dropout=0.05):
@@ -20,64 +19,64 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        # Ensure LoRA weights are on the same device and dtype as input
-        device = x.device
-        dtype = x.dtype
-        
-        if self.lora_A.device != device:
-            self.lora_A.data = self.lora_A.data.to(device)
-            self.lora_B.data = self.lora_B.data.to(device)
-            
-        # Cast to float32 for stability, similar to standard LoRA implementations
+        # 混合精度计算，防止溢出
         x_f32 = x.to(torch.float32)
         A_f32 = self.lora_A.to(torch.float32)
         B_f32 = self.lora_B.to(torch.float32)
         
         out = (self.dropout(x_f32) @ A_f32.T @ B_f32.T) * self.scaling
-        return out.to(dtype)
+        return out.to(x.dtype)
 
 class DualLoRALinear(nn.Module):
     def __init__(self, original_module, r=8, alpha=16, dropout=0.05):
         super().__init__()
         self.original_module = original_module
-        self.in_features = original_module.in_features
-        self.out_features = original_module.out_features
         
-        # Global Adapter (Aggregated)
-        self.adapter_global = LoRALinear(self.in_features, self.out_features, r, alpha, dropout)
+        # Global Adapter (Server Aggregated)
+        self.adapter_global = LoRALinear(original_module.in_features, original_module.out_features, r, alpha, dropout)
         
-        # Local Adapter (Personalized)
-        self.adapter_local = LoRALinear(self.in_features, self.out_features, r, alpha, dropout)
+        # Local Adapter (Client Personalized)
+        self.adapter_local = LoRALinear(original_module.in_features, original_module.out_features, r, alpha, dropout)
         
-        # Mixing Weight (Fixed 0.5 as per FedDPA default)
-        self.alpha_g = 0.5
-        self.alpha_l = 0.5
+        # Mixing Weights (Fixed 0.5 for standard FedDPA)
+        self.lam_g = 0.5
+        self.lam_l = 0.5
 
     def forward(self, x):
-        # Base output
-        out = self.original_module(x)
+        base_out = self.original_module(x)
+        global_out = self.adapter_global(x)
+        local_out = self.adapter_local(x)
         
-        # Global LoRA
-        out_g = self.adapter_global(x)
-        
-        # Local LoRA
-        out_l = self.adapter_local(x)
-        
-        # Mix
-        out = out + (self.alpha_g * out_g + self.alpha_l * out_l).to(out.dtype)
-        
-        return out
+        return base_out + self.lam_g * global_out + self.lam_l * local_out
 
 class FedDPAModelWrapper(nn.Module):
-    def __init__(self, base_model, lora_r=8, lora_alpha=16, lora_dropout=0.05, target_modules=None):
+    def __init__(self, base_model_path, lora_r=8, lora_alpha=16, lora_dropout=0.05, target_modules=None, torch_dtype=torch.float16):
         super().__init__()
-        self.base_model = base_model
+        
+        # [关键修复] 强制使用 eager 模式防止 RecursionError
+        print(f">> [Model] Loading Base Model with eager attention...", flush=True)
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+            attn_implementation="eager"
+        )
+        
+        # Enable GC
+        self.base_model.gradient_checkpointing_enable()
+        self.base_model.enable_input_require_grads()
+        
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.target_modules = target_modules or ["q_proj", "v_proj"]
         
         self.replace_layers()
+        
+        # Freeze Base
+        for n, p in self.base_model.named_parameters():
+            if "lora_" not in n:
+                p.requires_grad = False
 
     def replace_layers(self):
         modules_to_replace = {}
@@ -90,45 +89,25 @@ class FedDPAModelWrapper(nn.Module):
                 parent_name, child_name = name.rsplit('.', 1)
                 parent = self.base_model.get_submodule(parent_name)
             else:
-                parent_name = ''
-                child_name = name
-                parent = self.base_model
+                parent_name = ''; child_name = name; parent = self.base_model
             
             new_module = DualLoRALinear(module, self.lora_r, self.lora_alpha, self.lora_dropout)
             setattr(parent, child_name, new_module)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.base_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    
-    def get_global_params(self):
-        params = []
-        for module in self.base_model.modules():
-            if isinstance(module, DualLoRALinear):
-                params.append(module.adapter_global.lora_A)
-                params.append(module.adapter_global.lora_B)
-        return params
 
-    def get_local_params(self):
-        params = []
-        for module in self.base_model.modules():
-            if isinstance(module, DualLoRALinear):
-                params.append(module.adapter_local.lora_A)
-                params.append(module.adapter_local.lora_B)
-        return params
-    
-    def load_global_state_dict(self, state_dict):
-        # Load only global adapters
-        # state_dict keys should match the structure
-        # We assume state_dict is the full model state dict or just the adapters?
-        # For simplicity, let's assume we pass a dict of {layer_name: {'A': ..., 'B': ...}}
-        # Or better, just use load_state_dict with strict=False if keys match.
-        
-        # But here we want to load specifically into adapter_global
-        # Let's assume state_dict contains keys like "base_model.model.layers.0.self_attn.q_proj.adapter_global.lora_A"
-        self.load_state_dict(state_dict, strict=False)
-
+    # --- Parameter Helpers ---
     def get_global_state_dict(self):
-        return {k: v for k, v in self.state_dict().items() if "adapter_global" in k}
+        # Extract keys containing 'adapter_global'
+        return {k: v.cpu() for k, v in self.state_dict().items() if "adapter_global" in k}
 
     def get_local_state_dict(self):
-        return {k: v for k, v in self.state_dict().items() if "adapter_local" in k}
+        # Extract keys containing 'adapter_local'
+        return {k: v.cpu() for k, v in self.state_dict().items() if "adapter_local" in k}
+    
+    def load_global_state_dict(self, state_dict):
+        self.load_state_dict(state_dict, strict=False)
+
+    def load_local_state_dict(self, state_dict):
+        self.load_state_dict(state_dict, strict=False)

@@ -19,7 +19,7 @@ class SubspaceLoRAAdapter(nn.Module):
 
         # Total D for θ_D
         self.shapes = shapes
-        self.sizes = {k: A.numel() + B.numel() for k, (A, B) in shapes.items()}
+        self.sizes = {k: A.numel() + B.numel() for k,(A,B) in shapes.items()}
         self.offsets = {}
 
         offset = 0
@@ -32,9 +32,6 @@ class SubspaceLoRAAdapter(nn.Module):
         self.theta_s = nn.Parameter(
             torch.zeros(d_s, dtype=torch.float32, device=device)
         )
-        # Initialize with larger variance to match LoRA initialization scale
-        # LoRA A is usually initialized with Kaiming Uniform (std ~ 0.01)
-        # Since we project, we need slightly larger std in theta_s
         if not init_zeros:
             nn.init.normal_(self.theta_s, mean=0.0, std=0.02)
 
@@ -58,9 +55,6 @@ class SubspaceLoRAAdapter(nn.Module):
         return results
 
     def get_layer_deltas(self, layer_name):
-        """
-        Compute deltas for a specific layer on the fly.
-        """
         if layer_name not in self.shapes:
             return None
             
@@ -69,14 +63,9 @@ class SubspaceLoRAAdapter(nn.Module):
         A_num = A_shape.numel()
         B_num = B_shape.numel()
         
-        # Project only the needed slice
-        # The slice in theta_D corresponds to [off, off + A_num + B_num]
         theta_D_slice = self.proj.project_slice(self.theta_s, off, off + A_num + B_num)
         
         A = theta_D_slice[:A_num].reshape(A_shape)
         B = theta_D_slice[A_num:].reshape(B_shape)
-        
-        # Ensure they retain gradient history
-        # print(f"DEBUG: get_layer_deltas {layer_name} theta_s.grad_fn={self.theta_s.grad_fn} slice.grad_fn={theta_D_slice.grad_fn}")
         
         return A, B

@@ -156,7 +156,7 @@ def main():
     cfg = yaml.safe_load(open(cfg_path,"r"))
     
     # Change output dir for Ortho experiment
-    cfg["output_dir"] = "outputs/fed_alt_ortho"
+    cfg["output_dir"] = "outputs/fedless+alt+ortho"
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
     print(f">> [Main] Loading base model: {cfg['model']['path']}", flush=True)
@@ -253,16 +253,17 @@ def main():
 
     import math
     initial_lr = float(cfg["train"]["lr"])
-    min_lr = 1e-6  # Modified: Lower minimum LR to prevent overfitting
-    warmup_rounds = 5 # Modified: Remove warmup to start decay immediately
+    min_lr = 1e-6
+    warmup_rounds = 1
 
     # Loop
     for r in range(cfg["federated"]["rounds"]):
-        print(f"\n=== Round {r} (FedALT+Ortho) ===", flush=True)
+        print(f"\n=== Round {r} (FedLESS+ALT+Ortho) ===", flush=True)
         
-        # LR Scheduler: Cosine Decay from start
+        # LR Scheduler: Cosine Decay with Warmup
         if r < warmup_rounds:
-            current_lr = initial_lr
+            # Linear Warmup
+            current_lr = initial_lr * (r + 1) / warmup_rounds
         else:
             # Cosine Decay
             progress = (r - warmup_rounds) / (cfg["federated"]["rounds"] - warmup_rounds)
@@ -300,25 +301,16 @@ def main():
                 client_global_state = server.global_state
             else:
                 # Round > 0: 
-                # We need: Client Global = (Server History) + (Average of Others' Residuals)
+                # FIX: server.global_state['theta'] ALREADY includes the accumulated history (including previous round).
+                # Do NOT add row_residual_avg again (Double Accumulation Bug).
+                # If we wanted Leave-One-Out, we would need to subtract the client's contribution, 
+                # but for stability, we just use the current Global State.
                 
-                # 1. Calculate Sum of Residuals from previous round
-                sum_residuals = torch.zeros_like(server.previous_updates[0]['theta'])
-                for u in server.previous_updates:
-                    if u is not None:
-                        sum_residuals += u['theta']
-                
-                # 2. Calculate RoW Residual (Exclude self)
-                self_residual = server.previous_updates[cid]['theta']
-                row_residual_avg = (sum_residuals - self_residual) / (cfg["data"]["num_clients"] - 1)
-                
-                # 3. Add to Server History
-                # server.global_state['theta'] holds the accumulated history up to Round r-1
-                row_theta = server.global_state['theta'] + row_residual_avg
+                row_theta = server.global_state['theta']
                 
                 client_global_state = {
                     'theta': row_theta,
-                    'gates': server.global_state['gates'] # Gates are just averaged, not accumulated
+                    'gates': server.global_state['gates']
                 }
 
             # Instantiate client on the fly
@@ -334,7 +326,8 @@ def main():
                 device="cuda", 
                 data_collator=collator, 
                 dtype=torch_dtype,
-                lambda_ortho=0.1 # Orthogonality Strength
+                lambda_ortho=0.1, # Orthogonality Strength
+                gradient_accumulation_steps=cfg["train"].get("gradient_accumulation_steps", 1)
             )
             
             # Client loads Global (Frozen) and Local (Trainable)
@@ -393,9 +386,10 @@ def main():
                     agg_gates[k] += update['gates'][k] * weight
         
         # Accumulate Residuals into Global History
-        # Global(t) = Global(t-1) + Avg(Residuals)
+        # Global(t) = Global(t-1) + Avg(Residuals) * server_lr
         # Note: server.global_state['theta'] is the history from previous round
-        new_global_theta = server.global_state['theta'] + avg_residual
+        server_lr = 0.5
+        new_global_theta = server.global_state['theta'] + (avg_residual * server_lr)
 
         # Update Server State
         server.global_state = {
@@ -458,7 +452,7 @@ def main():
                 writer.writerow([
                     time.strftime("%Y-%m-%d %H:%M:%S"),
                     os.path.basename(cfg["model"]["path"]),
-                    "FedALT+Ortho",
+                    "FedLESS+ALT+Ortho",
                     r,
                     "ROUGE-1",
                     avg_rouge,
@@ -528,7 +522,7 @@ def main():
                         writer.writerow([
                             time.strftime("%Y-%m-%d %H:%M:%S"),
                             os.path.basename(cfg["model"]["path"]),
-                            f"FedALT+Ortho ({task_name})",
+                            f"FedLESS+ALT+Ortho ({task_name})",
                             r,
                             "ROUGE-1",
                             avg_c_score,
@@ -540,7 +534,7 @@ def main():
                         ])
                 
                 # Update Summary Table CSV
-                update_summary_csv(cfg["output_dir"], "FedALT+Ortho", r, client_scores)
+                update_summary_csv(cfg["output_dir"], "FedLESS+ALT+Ortho", r, client_scores)
             else:
                 print(f" Skipping Task-Specific Evaluation (Global ROUGE {avg_rouge:.4f} < 0.4)", flush=True)
 

@@ -138,7 +138,7 @@ def compute_rouge1(prediction, reference):
 def main(cfg_path="configs/fedsubspace_flan.yaml"):
     # Load config but override output dir for ALT experiment
     cfg = yaml.safe_load(open(cfg_path,"r"))
-    cfg["output_dir"] = "outputs/fed_alt_flan"
+    cfg["output_dir"] = "outputs/fedless+alt"
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
     print(f"Loading base model: {cfg['model']['path']}")
@@ -207,7 +207,7 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
         dl = DataLoader(ds, batch_size=cfg["train"]["batch_size"], shuffle=True, collate_fn=lambda b: collator(b))
         client_dataloaders.append((dl, collator))
     
-    print(f"Initialized {len(client_dataloaders)} client dataloaders for FedALT.")
+    print(f"Initialized {len(client_dataloaders)} client dataloaders for FedLESS+ALT.")
 
     rounds = cfg["federated"]["rounds"]
     
@@ -221,15 +221,16 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
 
     import math
     initial_lr = float(cfg["train"]["lr"])
-    min_lr = 1e-6  # Modified: Lower minimum LR to prevent overfitting
-    warmup_rounds = 0 # Modified: Remove warmup to start decay immediately
+    min_lr = 1e-6
+    warmup_rounds = 1
 
     for r in range(rounds):
-        print(f"\n--- Round {r} (FedALT) ---")
+        print(f"\n--- Round {r} (FedLESS+ALT) ---")
         
-        # LR Scheduler: Cosine Decay from start
+        # LR Scheduler: Cosine Decay with Warmup
         if r < warmup_rounds:
-            current_lr = initial_lr
+            # Linear Warmup
+            current_lr = initial_lr * (r + 1) / warmup_rounds
         else:
             # Cosine Decay
             progress = (r - warmup_rounds) / (rounds - warmup_rounds)
@@ -275,9 +276,19 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                 }
 
             # Instantiate client on the fly
-            client = FedAltClient(client_id=cid, model=shared_model, tokenizer=tokenizer, dataloader=dl,
-                                   output_dir=cfg["output_dir"], local_epochs=cfg["train"]["local_epochs"],
-                                   lr=current_lr, device="cuda", data_collator=collator, dtype=torch_dtype)
+            client = FedAltClient(
+                client_id=cid, 
+                model=shared_model, 
+                tokenizer=tokenizer, 
+                dataloader=dl,
+                output_dir=cfg["output_dir"], 
+                local_epochs=cfg["train"]["local_epochs"],
+                lr=current_lr, 
+                device="cuda", 
+                data_collator=collator, 
+                dtype=torch_dtype,
+                gradient_accumulation_steps=cfg["train"].get("gradient_accumulation_steps", 1)
+            )
             
             # Client loads Global (Frozen) and Local (Trainable)
             # Pass the full global state (theta + gates)
@@ -307,8 +318,9 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
         avg_update = server.aggregate(thetas_to_aggregate, sizes, update_state=False)
         
         # Accumulate Residuals into Global History
-        # Global(t) = Global(t-1) + Avg(Residuals)
-        new_global_theta = server.global_state['theta'] + avg_update['theta']
+        # Global(t) = Global(t-1) + Avg(Residuals) * server_lr
+        server_lr = 0.5
+        new_global_theta = server.global_state['theta'] + (avg_update['theta'] * server_lr)
         
         # Update Server State
         server.global_state = {
@@ -377,7 +389,7 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                 writer.writerow([
                     time.strftime("%Y-%m-%d %H:%M:%S"),
                     os.path.basename(cfg["model"]["path"]),
-                    "Flan (FedALT)",
+                    "Flan (FedLESS+ALT)",
                     r,
                     "ROUGE-1",
                     avg_rouge,
@@ -455,7 +467,7 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                         writer.writerow([
                             time.strftime("%Y-%m-%d %H:%M:%S"),
                             os.path.basename(cfg["model"]["path"]),
-                            f"Flan (FedALT-Client {cid})",
+                            f"Flan (FedLESS+ALT-Client {cid})",
                             r,
                             "ROUGE-1",
                             avg_c_score,
@@ -475,7 +487,7 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                     writer.writerow([
                         time.strftime("%Y-%m-%d %H:%M:%S"),
                         os.path.basename(cfg["model"]["path"]),
-                        "Flan (FedALT-Personalized)",
+                        "Flan (FedLESS+ALT-Personalized)",
                         r,
                         "ROUGE-1",
                         avg_personalized_rouge,
@@ -487,11 +499,11 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                     ])
                 
                 # Update Summary Table CSV
-                update_summary_csv(cfg["output_dir"], "FedALT", r, client_scores)
+                update_summary_csv(cfg["output_dir"], "FedLESS+ALT", r, client_scores)
             else:
                 print(f"Skipping Personalized Evaluation (Global ROUGE {avg_rouge:.4f} < 0.4)")
 
-    print("FedALT Experiment Completed.")
+    print("FedLESS+ALT Experiment Completed.")
 
 if __name__ == "__main__":
     main()

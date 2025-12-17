@@ -209,6 +209,7 @@ class AdapterInjector:
 
 def main(cfg_path="configs/fedsubspace_flan.yaml"):
     cfg = yaml.safe_load(open(cfg_path,"r"))
+    print(f">> [DEBUG] Config Loaded: Batch={cfg['train']['batch_size']}, Accum={cfg['train'].get('gradient_accumulation_steps', 'Default')}, LR={cfg['train']['lr']}")
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
     # Load Model
@@ -290,15 +291,46 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
 
     import math
     initial_lr = float(cfg["train"]["lr"])
-    min_lr = 1e-5
-    warmup_rounds = 5
+    min_lr = 1e-6
+    warmup_rounds = 1
 
-    for r in range(rounds):
+    # Initialize global gates (for aggregation)
+    global_gates = [p.detach().clone() for p in shared_model.get_gate_params()]
+
+    # --- Resume Logic ---
+    start_round = 0
+    checkpoint_pattern = re.compile(r"checkpoint_round(\d+).pt")
+    checkpoints = []
+    if os.path.exists(cfg["output_dir"]):
+        for f in os.listdir(cfg["output_dir"]):
+            match = checkpoint_pattern.match(f)
+            if match:
+                checkpoints.append(int(match.group(1)))
+    
+    if checkpoints:
+        last_round = max(checkpoints)
+        checkpoint_path = os.path.join(cfg["output_dir"], f"checkpoint_round{last_round}.pt")
+        print(f">> Resuming from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Load Theta
+        server.global_theta = checkpoint['theta']
+        
+        # Load Gates
+        if 'gates' in checkpoint:
+            global_gates = checkpoint['gates']
+            print(f">> Loaded global gates from checkpoint.")
+        
+        start_round = last_round + 1
+        print(f">> Starting from Round {start_round}")
+
+    for r in range(start_round, rounds):
         print(f"\n--- Round {r} ---")
         
-        # LR Scheduler: Constant for first 5 rounds, then Cosine Decay
+        # LR Scheduler: Cosine Decay with Warmup
         if r < warmup_rounds:
-            current_lr = initial_lr
+            # Linear Warmup
+            current_lr = initial_lr * (r + 1) / warmup_rounds
         else:
             # Cosine Decay
             progress = (r - warmup_rounds) / (rounds - warmup_rounds)
@@ -319,11 +351,26 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
             # Instantiate client on the fly to ensure full cleanup after training
             client = FedSubspaceClient(client_id=cid, model=shared_model, tokenizer=tokenizer, dataloader=dl,
                                    output_dir=cfg["output_dir"], local_epochs=cfg["train"]["local_epochs"],
-                                   lr=current_lr, device="cuda", data_collator=collator, dtype=torch_dtype)
+                                   lr=current_lr, device="cuda", data_collator=collator, dtype=torch_dtype,
+                                   batch_size=cfg["train"]["batch_size"],
+                                   gradient_accumulation_steps=cfg["train"].get("gradient_accumulation_steps", 1))
             
+            # Load Global Theta
             client.load_theta(server.global_theta)
+            
+            # Load Global Gates (Fix for Shared State Bug)
+            model_gates = shared_model.get_gate_params()
+            for p_model, p_global in zip(model_gates, global_gates):
+                p_model.data.copy_(p_global)
+            
             client.train()
-            thetas.append(client.get_theta())
+            
+            # Collect Updates
+            theta_update = client.get_theta()
+            # Format gates as dict for server aggregation
+            gate_update = {f"gate_{i}": p.detach().clone() for i, p in enumerate(shared_model.get_gate_params())}
+            
+            thetas.append({'theta': theta_update, 'gates': gate_update})
             sizes.append(len(client.dataloader.dataset))
             
             # Destroy client and force cleanup
@@ -333,66 +380,49 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
             torch.cuda.empty_cache()
         
         # Aggregate
-        new_theta = server.aggregate(thetas, sizes)
+        aggregated = server.aggregate(thetas, sizes)
+        
+        # Update Global State
+        server.global_theta = aggregated['theta']
+        new_theta = server.global_theta
+        
+        # Update Global Gates
+        aggregated_gates = aggregated['gates']
+        # Sort by index to ensure order
+        sorted_keys = sorted(aggregated_gates.keys(), key=lambda x: int(x.split('_')[1]))
+        global_gates = [aggregated_gates[k] for k in sorted_keys]
+        
         torch.save(new_theta, os.path.join(cfg["output_dir"], f"theta_round{r}.pt"))
         
+        # Save Checkpoint (Theta + Gates) for Resume
+        checkpoint = {
+            'theta': new_theta,
+            'gates': global_gates
+        }
+        torch.save(checkpoint, os.path.join(cfg["output_dir"], f"checkpoint_round{r}.pt"))
+
         # Evaluate
         if cfg["eval"]["enabled"] and (r % cfg["eval"].get("eval_every", 1) == 0):
             print(f"Evaluating Round {r}...")
-            adapter_state = decode_adapter(new_theta, lora_shapes, seed=cfg["subspace"]["seed"], device=base.device)
             
-            with AdapterInjector(base, adapter_state):
-                # 1. Global Eval
-                scores = []
-                print("Running Global Evaluation...")
-                for ex in tqdm(global_eval_data, desc="Global Eval"):
-                    raw_input = ex["input"]
-                    prompt = f"### Instruction:\n{raw_input}\n\n### Response:\n"
-                    
-                    inputs = tokenizer(prompt, return_tensors="pt").to(base.device)
-                    with torch.no_grad():
-                        outputs = base.generate(**inputs, max_new_tokens=50, pad_token_id=tokenizer.eos_token_id)
-                    
-                    input_len = inputs["input_ids"].shape[1]
-                    pred = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-                    # Cut off at the start of the next instruction or double newline to avoid hallucination
-                    if "###" in pred:
-                        pred = pred.split("###")[0]
-                    pred = pred.strip()
-                    
-                    # [DEBUG] Print first few predictions to diagnose 0.0 scores
-                    if len(scores) < 3:
-                        print(f"\n[DEBUG] Prompt: {prompt}")
-                        print(f"[DEBUG] Ref: {ex['output']}")
-                        print(f"[DEBUG] Pred: {pred}")
-                        print("-" * 40)
-
-                    score = compute_rouge1(pred, ex["output"])
-                    scores.append(score)
-                
-                avg_rouge = sum(scores) / len(scores) if scores else 0
-                print(f"Round {r} Global ROUGE-1: {avg_rouge:.4f}")
-                
-                # Save result
-                with open(csv_file, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        time.strftime("%Y-%m-%d %H:%M:%S"),
-                        os.path.basename(cfg["model"]["path"]),
-                        "Flan",
-                        r,
-                        "ROUGE-1",
-                        avg_rouge,
-                        subspace_params,
-                        full_lora_params,
-                        trainable_params,
-                        all_param,
-                        f"{100 * trainable_params / all_param:.4f}%"
-                    ])
+            # Load Global Theta into Shared Model
+            shared_model.adapter.theta_s.data.copy_(new_theta.to(base.device))
             
-                # --- Personalized Evaluation (Local Eval for FedSubspace) ---
-            # Only run if global performance is decent (> 0.4) to save time
-            if avg_rouge >= 0.4:
+            # Load Global Gates into Shared Model
+            model_gates = shared_model.get_gate_params()
+            for p_model, p_global in zip(model_gates, global_gates):
+                p_model.data.copy_(p_global)
+            
+            # 1. Global Eval (Skipped as per request)
+            # scores = []
+            # print("Running Global Evaluation...")
+            # ... (Global Eval Code Removed) ...
+            # avg_rouge = sum(scores) / len(scores) if scores else 0
+            # print(f"Round {r} Global ROUGE-1: {avg_rouge:.4f}")
+            
+            # --- Personalized Evaluation (Local Eval for FedSubspace) ---
+            # Always run task-specific evaluation
+            if True:
                 print(f"Running Task-Specific Evaluation for Round {r}...")
                 client_scores = {}
                 
@@ -419,11 +449,11 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                         pred = pred.strip()
                         
                         # [DEBUG] Print first few predictions for each client
-                        if i < 2:
-                            print(f"\n[DEBUG Client {cid}] Prompt: {prompt[:50]}...")
-                            print(f"[DEBUG Client {cid}] Ref: {ex['output']}")
-                            print(f"[DEBUG Client {cid}] Pred: {pred}")
-                            print("-" * 20)
+                        # if i < 2:
+                        #     print(f"\n[DEBUG Client {cid}] Prompt: {prompt[:50]}...")
+                        #     print(f"[DEBUG Client {cid}] Ref: {ex['output']}")
+                        #     print(f"[DEBUG Client {cid}] Pred: {pred}")
+                        #     print("-" * 20)
 
                         c_scores.append(compute_rouge1(pred, ex["output"]))
                     
@@ -451,9 +481,11 @@ def main(cfg_path="configs/fedsubspace_flan.yaml"):
                         ])
                 
                 # Update Summary Table CSV
-                update_summary_csv(cfg["output_dir"], "FedSubspace", r, client_scores)
-            else:
-                print(f"Skipping Task-Specific Evaluation (Global ROUGE {avg_rouge:.4f} < 0.4)")
+                update_summary_csv(cfg["output_dir"], "FedLESS", r, client_scores)
+            
+            # injector.remove_adapter()
+            # else:
+            #     print(f"Skipping Task-Specific Evaluation (Global ROUGE {avg_rouge:.4f} < 0.4)")
     
     print("Experiment Completed.")
 

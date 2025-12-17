@@ -23,10 +23,8 @@ class DualSubspaceLoRALinear(nn.Module):
         self.gate_g = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         
         # Local Gate: Trainable.
-        # User observation: In Round 0, Global is 0, so Model = Base + Local.
-        # This is equivalent to FedSubspace. FedSubspace uses gate=0.5 and works well.
-        # So we initialize gate_l to 0.5 to ensure strong gradients and match FedSubspace behavior.
-        # FIX: Initialize to 0.0 to start from pure Base Model and avoid noise injection.
+        # FedAlt & Fed-LESS: Initialize to 0.0 (Strict Zero)
+        # This ensures Round 0 starts from pure Base Model.
         self.gate_l = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
@@ -75,9 +73,8 @@ class FedDualSubspaceModelWrapper(nn.Module):
         # This ensures they project to the same "semantic" LoRA space
         # Global Adapter: Initialize to Zeros (Identity) because gate_g is fixed at 1.0
         self.adapter_global = SubspaceLoRAAdapter(lora_shapes, d_s, seed, device=base_model.device, init_zeros=True)
-        # Local Adapter: Initialize to Random (Noise) but gated by 0.1 initially
-        # UniLoRA initializes vector bank with uniform(-0.02, 0.02) and logits with normal(0, 0.1)
-        # We should initialize Local Adapter with small noise to break symmetry and allow gradients
+        # Local Adapter: Initialize to Random (False)
+        # We want to learn pure residuals from 0.
         self.adapter_local = SubspaceLoRAAdapter(lora_shapes, d_s, seed, device=base_model.device, init_zeros=False)
         
         self.replace_layers()
